@@ -578,6 +578,40 @@ defmodule Mix.Project do
       Mix.Project.deps_path()
       #=> "/path/to/project/deps"
 
+  ## Versioned dependencies
+
+  When `:versioned_deps` is set to `true` in the project configuration,
+  each dependency is checked out under a per-version subdirectory:
+
+      deps/
+        foo/
+          1.2.3/        # actual checkout (this is what Mix uses)
+          1.4.0/        # another cached version
+          current → 1.2.3   # symlink maintained by Mix
+
+  Mix internals always use the real per-version path. The `current`
+  symlink is provided for external tooling (Phoenix asset pipelines,
+  NIF build scripts, and so on) that need a stable filesystem path
+  regardless of which version is active. To use it, refer to
+  `deps/<app>/current/...` instead of `deps/<app>/...`.
+
+  Path dependencies and dependencies without a usable lock entry
+  fall back to the unversioned `deps/<app>/` layout.
+
+  > #### Pair with `:build_per_lockfile` {: .warning}
+  >
+  > Enabling `:versioned_deps` alone caches dep *sources* across branch
+  > switches but the build directory `_build/<env>/lib/<app>/` is still
+  > shared, so compiled artifacts will be clobbered when you switch
+  > to a different version of the same dep. To get the full no-recompile
+  > experience, also set `:build_per_lockfile` to `true` so the build
+  > directory is keyed by the lockfile content.
+  >
+  > Enabling `:versioned_deps` on a project that already has unversioned
+  > deps checked out will cause the next `mix deps.get` to re-fetch each
+  > dep into its versioned subdirectory; the old `deps/<app>/` checkout
+  > is left orphaned. Run `mix deps.clean --all` before opting in to
+  > avoid the disk waste, or `mix deps.clean <app>` per-dep.
   """
   @spec deps_path(keyword) :: Path.t()
   def deps_path(config \\ config()) do
@@ -731,7 +765,7 @@ defmodule Mix.Project do
 
   The build path is built based on the `:build_path` configuration
   (which defaults to `"_build"`) and a subdirectory. The subdirectory
-  is built based on two factors:
+  is built based on three factors:
 
     * If `:build_per_environment` is set (the default), the subdirectory
       is the value of `Mix.env/0` (which can be set via `MIX_ENV`).
@@ -739,6 +773,23 @@ defmodule Mix.Project do
 
     * If `Mix.target/0` is set (often via the `MIX_TARGET` environment
       variable), it will be used as a prefix to the subdirectory.
+
+    * If `:build_per_lockfile` is set to `true`, and the current `mix.lock`
+      differs from the one the canonical build was made against, a short
+      content hash of `mix.lock` is appended (e.g. `_build/dev-a1b2c3d4`).
+      This lets compiled artifacts for multiple branches coexist on disk
+      so switching branches does not force recompilation. The
+      `MIX_BUILD_TAG` environment variable overrides the auto-derived
+      hash with an explicit label (e.g. a branch name).
+
+      To bound disk usage, set `:build_per_lockfile_keep` to an integer;
+      after each successful compile, only the `N` most recently used
+      hashed build directories are retained (the canonical and the
+      currently active build are always preserved). The default is
+      `:infinity`, which never auto-prunes — Mix prints a one-line
+      summary after each compile suggesting `mix deps.clean
+      --include-branches` for manual cleanup. Set
+      `:build_per_lockfile_hint` to `false` to silence the summary.
 
   The behaviour of this function can be modified by two environment
   variables, `MIX_BUILD_ROOT` and `MIX_BUILD_PATH`, see [the Mix
@@ -780,9 +831,98 @@ defmodule Mix.Project do
   end
 
   defp do_build_path(config) do
+    Path.expand(canonical_build_dir(config) <> build_per_lockfile_suffix(config))
+  end
+
+  @doc false
+  # Returns the absolute path of the *canonical* (unsuffixed) build directory
+  # for the given config — i.e. `_build/<env>` regardless of whether
+  # `:build_per_lockfile` is on. Used in two places:
+  #
+  #   * `with_build_lock/2` locks on this path when `:build_per_lockfile`
+  #     is enabled, so all sibling builds in the same project serialize
+  #     through one mutex and the per-hash routing decision can change
+  #     under the lock without race.
+  #
+  #   * `Mix.Dep.BuildCache` reads the sentinel and seeds new hashed
+  #     dirs from siblings, both of which need the canonical path.
+  @spec canonical_build_path(keyword) :: Path.t()
+  def canonical_build_path(config \\ config()) do
+    cond do
+      deps_build_path = config[:deps_build_path] ->
+        deps_build_path
+
+      build_path = System.get_env("MIX_BUILD_PATH") ->
+        Path.expand(build_path)
+
+      true ->
+        # `Keyword.put_new` provides the default for callers (notably
+        # `Mix.Dep.BuildCache`) that can be reached with partial configs.
+        # `do_build_path/1` keeps the strict validation so `mix.exs` with
+        # an invalid `:build_per_environment` value still errors loudly.
+        config = Keyword.put_new(config, :build_per_environment, true)
+        Path.expand(canonical_build_dir(config))
+    end
+  end
+
+  defp canonical_build_dir(config) do
     dir = System.get_env("MIX_BUILD_ROOT") || config[:build_path] || "_build"
     subdir = build_target() <> build_per_environment(config)
-    Path.expand(dir <> "/" <> subdir)
+    dir <> "/" <> subdir
+  end
+
+  # When `:build_per_lockfile` is enabled, suffix the build directory with
+  # a short hash of the project's lockfile content. This means switching
+  # between branches that have different `mix.lock` files lands in different
+  # build directories, so compiled artifacts are not lost when switching back.
+  #
+  # The canonical (unsuffixed) build directory remains in use whenever the
+  # current lockfile matches the one it was built against; we only divert
+  # to a hashed directory on detected mismatch (see Mix.Dep.BuildCache).
+  #
+  # MIX_BUILD_TAG overrides the auto-derived hash with an explicit label.
+  defp build_per_lockfile_suffix(config) do
+    cond do
+      not Keyword.get(config, :build_per_lockfile, false) ->
+        ""
+
+      tag = System.get_env("MIX_BUILD_TAG") ->
+        "-" <> sanitize_tag(tag)
+
+      true ->
+        case Mix.Dep.BuildCache.active_build_tag(config) do
+          nil -> ""
+          tag -> "-" <> tag
+        end
+    end
+  end
+
+  # Sanitize a user-supplied build tag (typically from MIX_BUILD_TAG) so it
+  # is safe to use as a directory-name segment. Three classes of input are
+  # rejected loudly rather than silently neutralized:
+  #
+  #   * empty after replacement
+  #   * collapses to nothing but dots (`.`, `..`, `...`)
+  #   * leading dot or dash (would either traverse, or look like a flag)
+  #
+  # Internal dots are preserved (branch names like `release.v1` are common),
+  # but runs of `.` are collapsed to a single dot to neutralize `..` traversal.
+  defp sanitize_tag(tag) do
+    cleaned =
+      tag
+      |> String.replace(~r/[^A-Za-z0-9._-]/, "-")
+      |> String.replace(~r/\.+/, ".")
+      |> String.trim_leading(".")
+      |> String.trim_leading("-")
+      |> String.slice(0, 64)
+
+    if cleaned == "" do
+      Mix.raise(
+        "MIX_BUILD_TAG=#{inspect(tag)} produced an empty or unsafe build directory suffix"
+      )
+    end
+
+    cleaned
   end
 
   defp build_target do
@@ -1003,8 +1143,23 @@ defmodule Mix.Project do
     # a lock. Note that compile.all covers compile.elixir, but the
     # latter can still be invoked directly, so we put the lock over
     # each individual task.
-
-    build_path = build_path(config)
+    #
+    # When `:build_per_lockfile` is enabled the active build path can
+    # change *under the lock* — the post-claim divert happens after the
+    # canonical sentinel is written. Locking on `build_path/1` (which
+    # consults the sentinel) would let two pristine concurrent compiles
+    # both decide on the canonical path, take the canonical lock, and
+    # then re-route the second one's *output* to a hashed dir while it
+    # still holds only the canonical lock — leaving the hashed dir
+    # unprotected from a third concurrent compile. We solve this by
+    # always locking on the canonical path when the feature is on,
+    # so all sibling builds in the project serialize through one mutex.
+    lock_path =
+      if Keyword.get(config, :build_per_lockfile, false) do
+        canonical_build_path(config)
+      else
+        build_path(config)
+      end
 
     on_taken = fn os_pid ->
       Mix.shell().error([
@@ -1013,7 +1168,7 @@ defmodule Mix.Project do
       ])
     end
 
-    Mix.Sync.Lock.with_lock(build_path, fun, on_taken: on_taken)
+    Mix.Sync.Lock.with_lock(lock_path, fun, on_taken: on_taken)
   end
 
   @doc false

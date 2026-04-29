@@ -20,13 +20,29 @@ defmodule Mix.Tasks.Deps.Clean do
     * `--all` - deletes all dependencies
     * `--unused` - deletes only unused dependencies
       (i.e. dependencies no longer mentioned in `mix.exs`)
+    * `--include-branches` - when `:build_per_lockfile` is enabled, also
+      removes hashed build directories (`_build/<env>-<hash>/`) for lockfiles
+      other than the current one. Has no effect when `:build_per_lockfile`
+      is disabled.
+    * `--keep N` - when used with `--include-branches`, keeps the `N` most
+      recently used hashed build directories instead of removing all of
+      them. The active build directory is always preserved. Implies
+      `--include-branches`.
 
   By default this task works across all environments,
   unless `--only` is given which will clean all dependencies
   for the chosen environment.
   """
 
-  @switches [unlock: :boolean, all: :boolean, only: :string, unused: :boolean, build: :boolean]
+  @switches [
+    unlock: :boolean,
+    all: :boolean,
+    only: :string,
+    unused: :boolean,
+    build: :boolean,
+    include_branches: :boolean,
+    keep: :integer
+  ]
 
   @impl true
   def run(args) do
@@ -69,6 +85,11 @@ defmodule Mix.Tasks.Deps.Clean do
 
     Mix.Project.with_build_lock(fn ->
       clean_build(apps_to_clean, build_path)
+
+      # `--keep N` implies `--include-branches`.
+      if opts[:include_branches] || opts[:keep] do
+        clean_stale_branch_builds(opts[:keep])
+      end
     end)
 
     Mix.Project.with_deps_lock(fn ->
@@ -80,6 +101,45 @@ defmodule Mix.Tasks.Deps.Clean do
         :ok
       end
     end)
+  end
+
+  # Removes hashed `_build/<env>-<hash>/` directories. With `keep` as nil,
+  # removes all dirs other than the active one. With `keep: N`, defers to
+  # `Mix.Dep.BuildCache.prune_to/2` to keep the N most recently used.
+  # No-op when `:build_per_lockfile` is not enabled.
+  defp clean_stale_branch_builds(keep) do
+    config = Mix.Project.config()
+
+    if Keyword.get(config, :build_per_lockfile, false) do
+      case keep do
+        nil ->
+          remove_inactive_branch_builds(config)
+
+        n when is_integer(n) and n >= 0 ->
+          _ = Mix.Dep.BuildCache.prune_to(n, config)
+
+        other ->
+          Mix.raise("expected --keep to be a non-negative integer, got: #{inspect(other)}")
+      end
+    end
+
+    :ok
+  end
+
+  # Deletes every hashed branch build directory except the one currently
+  # active for this Mix invocation. The canonical `_build/<env>/` is never
+  # in `hashed_build_dirs/1` and is preserved implicitly.
+  defp remove_inactive_branch_builds(config) do
+    active = Path.expand(Mix.Project.build_path(config))
+    shell = Mix.shell()
+
+    for path <- Mix.Dep.BuildCache.hashed_build_dirs(config),
+        Path.expand(path) != active do
+      shell.info("* Cleaning cached build #{Path.relative_to_cwd(path)}")
+      File.rm_rf(path) |> maybe_warn_failed_file_deletion()
+    end
+
+    :ok
   end
 
   defp checked_deps(build_path, deps_path) do

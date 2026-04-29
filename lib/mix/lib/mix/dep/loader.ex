@@ -178,7 +178,7 @@ defmodule Mix.Dep.Loader do
     bin_app = Atom.to_string(app)
 
     config = Mix.Project.config()
-    dest = Path.join(Mix.Project.deps_path(config), bin_app)
+    dest = compute_dest(config, app, bin_app, opts)
     build = Path.join([Mix.Project.build_path(config), "lib", bin_app])
 
     opts =
@@ -223,6 +223,156 @@ defmodule Mix.Dep.Loader do
     Enum.find_value(Mix.SCM.available(), {nil, opts}, fn scm ->
       (new = scm.accepts_options(app, opts)) && {scm, new}
     end)
+  end
+
+  # Computes the on-disk destination for a dep. When `:versioned_deps`
+  # is enabled and we can extract a stable version identifier from the
+  # lock entry, the dep is checked out under `deps/<app>/<version>/`,
+  # with a `deps/<app>/current` symlink maintained by Mix.Dep.Fetcher.
+  # Falls back to the unversioned `deps/<app>/` path when no version
+  # is available (no lock entry, path dep, or feature disabled).
+  defp compute_dest(config, app, bin_app, opts) do
+    base = Path.join(Mix.Project.deps_path(config), bin_app)
+
+    if Keyword.get(config, :versioned_deps, false) do
+      case dep_version_for(app, opts, config) do
+        nil ->
+          # If the user enabled `:versioned_deps` after deps were already
+          # checked out unversioned, deps/<app>/ is now a non-versioned
+          # checkout. Surface that condition so they know to migrate.
+          maybe_warn_unversioned_checkout(base, bin_app)
+          base
+
+        version ->
+          Path.join(base, version)
+      end
+    else
+      base
+    end
+  end
+
+  # Extracts a directory-safe version identifier from the lock entry
+  # for the given app. Path deps yield nil (no versioning).
+  #
+  # The lockfile path is taken from `config[:lockfile]` rather than going
+  # through `Mix.Dep.Lock.read/0`'s default-arg lookup, which itself
+  # calls `Mix.Project.config()`. This function is reachable from inside
+  # `Mix.ProjectStack.push/3` (via dep loading), and re-entering the
+  # ProjectStack GenServer there deadlocks the project stack process —
+  # the same shape of bug we already fixed once in
+  # `Mix.Dep.BuildCache.active_build_tag/1`.
+  defp dep_version_for(app, opts, config) do
+    lock =
+      cond do
+        opts[:lock] -> %{app => opts[:lock]}
+        true -> Mix.Dep.Lock.read(config[:lockfile] || "mix.lock")
+      end
+
+    lock_version(lock[app])
+  end
+
+  defp maybe_warn_unversioned_checkout(base, bin_app) do
+    if File.regular?(Path.join(base, "mix.exs")) or
+         File.regular?(Path.join(base, "rebar.config")) do
+      Mix.shell().error(
+        "warning: deps/#{bin_app} appears to be a non-versioned checkout but " <>
+          ":versioned_deps is enabled. Run \"mix deps.clean #{bin_app}\" and " <>
+          "\"mix deps.get\" to migrate it to deps/#{bin_app}/<version>/."
+      )
+    end
+  end
+
+  @doc """
+  Extracts a directory-safe version identifier from a `mix.lock` entry.
+
+  Used by `:versioned_deps` to compute the per-version checkout path
+  `deps/<app>/<version>/`. The returned string is safe to use as a single
+  path segment (see `sanitize_version/1`).
+
+  Returns `nil` when no usable identifier can be derived. The caller falls
+  back to the unversioned `deps/<app>/` layout. Nil is returned for:
+
+    * a `nil` lock entry — the dep was just added to `mix.exs` and
+      `mix deps.get` has not written a lock yet
+    * path deps — the source lives outside `deps/` and has no SCM-managed
+      version concept
+    * unknown or future SCM tuple shapes — fails closed rather than
+      fabricate a version string that does not reflect the checkout
+
+  ## Lock entry shapes
+
+  The trailing Hex fields evolved across versions, so all three Hex
+  tuple arities are matched:
+
+    * `{:hex, app, version, hash, managers, deps, repo, outer_hash}` (8-tuple, current)
+    * `{:hex, app, version, hash, managers, deps, repo}` (7-tuple)
+    * `{:hex, app, version, hash, managers, deps}` (6-tuple, pre-1.10)
+    * `{:git, url, sha, opts}` — `opts` may contain `:ref`, `:branch`, or `:tag`
+
+  ## Return shape per SCM
+
+    * Hex: the lock's version string, sanitized
+      (e.g. `"1.0.0-rc.1+build.5"` becomes `"1.0.0-rc.1-build.5"`)
+    * Git with a ref/branch/tag: `"<sanitized-ref>-<8-char-sha>"`
+      (e.g. `"main-abcdef12"`)
+    * Git without a ref: `"<8-char-sha>"` (e.g. `"abcdef12"`)
+
+  ## Examples
+
+      iex> Mix.Dep.Loader.lock_version({:hex, :foo, "1.2.3", "h", [], [], "hexpm", "h"})
+      "1.2.3"
+
+      iex> Mix.Dep.Loader.lock_version({:git, "url", "abcdef1234567890", [ref: "main"]})
+      "main-abcdef12"
+
+      iex> Mix.Dep.Loader.lock_version({:path, "../foo", []})
+      nil
+
+  The function is public (rather than private) so the test suite can
+  exercise the SCM-shape matrix directly without setting up a full
+  project. It is otherwise an internal implementation detail of
+  `compute_dest/4`.
+  """
+  @spec lock_version(term()) :: String.t() | nil
+  def lock_version(nil), do: nil
+
+  def lock_version({:hex, _pkg, version, _hash, _managers, _deps, _repo, _outer_hash})
+      when is_binary(version),
+      do: sanitize_version(version)
+
+  def lock_version({:hex, _pkg, version, _hash, _managers, _deps, _repo})
+      when is_binary(version),
+      do: sanitize_version(version)
+
+  def lock_version({:hex, _pkg, version, _hash, _managers, _deps})
+      when is_binary(version),
+      do: sanitize_version(version)
+
+  def lock_version({:git, _url, sha, lock_opts}) when is_binary(sha) do
+    short = binary_part(sha, 0, min(byte_size(sha), 8))
+
+    case lock_opts[:ref] || lock_opts[:branch] || lock_opts[:tag] do
+      nil -> short
+      ref when is_binary(ref) -> sanitize_version(ref) <> "-" <> short
+      _ -> short
+    end
+  end
+
+  # Path deps and unknown SCMs: no versioning. Catches anything not matched
+  # by the explicit clauses above (including future Hex tuple sizes that
+  # Mix doesn't yet recognize, in which case skipping versioning is the
+  # safe behavior — the dep still works, it just shares `deps/<app>/`).
+  def lock_version(_), do: nil
+
+  # Replaces filesystem-unfriendly characters. POSIX accepts most
+  # things but `+` and `/` cause issues with shells, build tools,
+  # and URLs. Pre-release/build separators in semver (`-`, `+`) are
+  # collapsed to `-`.
+  defp sanitize_version(version) do
+    version
+    |> String.replace(~r{[/+\s]+}, "-")
+    |> String.replace(~r{-+}, "-")
+    |> String.trim("-")
   end
 
   # Note that we ignore Make dependencies because the

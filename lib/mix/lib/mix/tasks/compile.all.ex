@@ -67,6 +67,15 @@ defmodule Mix.Tasks.Compile.All do
         Mix.Task.reenable("compile.all")
         {:noop, []}
       else
+        # If `:build_per_lockfile` is on and we have routed to a hashed
+        # build dir that does not yet exist, seed it from the most recently
+        # modified compatible build dir to enable incremental recompilation.
+        # If we have routed to the canonical build dir and it has not yet
+        # been claimed by a lockfile hash, claim it now.
+        build_path = Mix.Project.build_path(config)
+        Mix.Dep.BuildCache.seed_from_nearest(build_path, config)
+        Mix.Dep.BuildCache.claim_canonical(build_path, config)
+
         # Build the project structure so we can write down compiled files.
         Mix.Project.build_structure(config)
 
@@ -74,6 +83,15 @@ defmodule Mix.Tasks.Compile.All do
         |> Mix.Task.Compiler.compilers()
         |> Mix.Task.Compiler.run(args)
       end
+
+    # Post-compile build-cache maintenance for `:build_per_lockfile`:
+    #   1. Refresh the active dir's size cache so the status hint is accurate.
+    #   2. Auto-prune to `:build_per_lockfile_keep` (default `:infinity`).
+    #   3. Print the status hint.
+    # All three are no-ops when the feature is off.
+    if status != :error and "--no-compile" not in args do
+      maintain_build_cache(config)
+    end
 
     if status == :error and "--return-errors" not in args do
       exit({:shutdown, 1})
@@ -95,6 +113,25 @@ defmodule Mix.Tasks.Compile.All do
     end
 
     {status, diagnostics}
+  end
+
+  defp maintain_build_cache(config) do
+    if Keyword.get(config, :build_per_lockfile, false) do
+      build_path = Mix.Project.build_path(config)
+
+      # Refresh the active dir's size cache so the hint reports a fresh
+      # number. Other dirs use whatever was cached on their last compile.
+      _ = Mix.Dep.BuildCache.refresh_size_cache(build_path)
+
+      # Auto-prune if the user opted in via `:build_per_lockfile_keep`.
+      keep = Keyword.get(config, :build_per_lockfile_keep, :infinity)
+      _ = Mix.Dep.BuildCache.prune_to(keep, config)
+
+      # One-line status hint. Suppressed when only the canonical exists.
+      Mix.Dep.BuildCache.print_status(config)
+    end
+
+    :ok
   end
 
   @doc """

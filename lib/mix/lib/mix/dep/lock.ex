@@ -36,6 +36,33 @@ defmodule Mix.Dep.Lock do
   end
 
   @doc """
+  Returns a short content-addressable hash of the lockfile.
+
+  Returns `nil` if the lockfile does not exist or is empty.
+  The hash is the first 8 hex characters of the SHA-256 of the
+  lockfile contents, which is sufficient for use as a cache key:
+  even at 1000 distinct lockfiles, collision probability is ~10^-4,
+  and a stale collision is caught by per-dep manifest checks during
+  compilation (worst case is an unnecessary recompile, never a
+  correctness bug).
+  """
+  @spec hash(Path.t()) :: String.t() | nil
+  def hash(lockfile \\ lockfile()) do
+    case File.read(lockfile) do
+      {:ok, ""} ->
+        nil
+
+      {:ok, contents} ->
+        :crypto.hash(:sha256, contents)
+        |> Base.encode16(case: :lower)
+        |> binary_part(0, 8)
+
+      _ ->
+        nil
+    end
+  end
+
+  @doc """
   Receives a map and writes it as the latest lock.
   """
   @spec write(map(), write_opts) :: :ok

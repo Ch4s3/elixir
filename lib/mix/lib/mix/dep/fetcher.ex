@@ -78,6 +78,7 @@ defmodule Mix.Dep.Fetcher do
 
         if new do
           dep = put_in(dep.opts[:lock], new)
+          maybe_update_current_symlink(dep)
           {dep, [app | acc], Map.put(lock, app, new)}
         else
           {dep, acc, lock}
@@ -125,19 +126,85 @@ defmodule Mix.Dep.Fetcher do
     {apps, all_deps}
   end
 
+  # When `:versioned_deps` is enabled, `opts[:dest]` is `deps/<app>/<version>/`.
+  # Maintain a relative `deps/<app>/current` symlink to the active version so
+  # external tools (Phoenix asset pipelines, NIF build scripts, etc.) can refer
+  # to a stable path. The symlink is updated atomically via temp+rename so a
+  # concurrent reader never sees a half-replaced link.
+  defp maybe_update_current_symlink(%Mix.Dep{opts: opts}) do
+    dest = opts[:dest]
+    parent = Path.dirname(dest)
+
+    case versioned_dep_dir?(dest, parent) do
+      true -> swap_current_symlink(parent, Path.basename(dest))
+      false -> :ok
+    end
+  end
+
+  # True when `:versioned_deps` is on AND `dest` is a real versioned path.
+  # A versioned dest looks like `<deps_path>/<app>/<version>/`, so its
+  # grandparent must equal `deps_path` after expansion. We compare the
+  # expanded forms because `dest` and `deps_path` can disagree on trailing
+  # slashes, relative-vs-absolute, or symlink resolution depending on how
+  # they were constructed.
+  defp versioned_dep_dir?(dest, parent) do
+    Keyword.get(Mix.Project.config(), :versioned_deps, false) and
+      File.dir?(dest) and
+      Path.expand(Path.dirname(parent)) == Path.expand(Mix.Project.deps_path())
+  end
+
+  defp swap_current_symlink(parent, version) do
+    current = Path.join(parent, "current")
+    tmp = current <> ".tmp"
+
+    # Clear any leftover tmp from a prior interrupted run; ignore failures.
+    _ = File.rm(tmp)
+
+    with :ok <- File.ln_s(version, tmp),
+         :ok <- File.rename(tmp, current) do
+      :ok
+    else
+      {:error, reason} ->
+        _ = File.rm(tmp)
+        warn_symlink_failure(current, reason)
+    end
+  end
+
+  defp warn_symlink_failure(current, reason) do
+    Mix.shell().error(
+      "warning: could not update current symlink at " <>
+        "#{Path.relative_to_cwd(current)}: #{:file.format_error(reason)}"
+    )
+  end
+
   defp mark_as_fetched(deps) do
-    build_path =
-      Mix.Project.build_path()
-      |> Path.dirname()
+    # Walk every per-environment build dir under `_build/` (dev, test,
+    # dev-<hash>, etc.) and remove the dep's compile manifest so the
+    # next compile re-resolves it. Avoids `Path.wildcard` because the
+    # `_build/` parent path can contain glob meta characters (`{`,
+    # `,`, `}`) on some users' machines and would mis-match silently.
+    build_root = Mix.Project.build_path() |> Path.dirname()
 
     for %Mix.Dep{app: app, scm: scm} <- deps, scm.fetchable?() do
-      build_path
-      |> Path.join("*/lib/#{app}/.mix/compile.elixir_scm")
-      |> Path.wildcard(match_dot: true)
-      |> Enum.each(&File.rm/1)
+      remove_compile_manifests(build_root, app)
     end
 
     :ok
+  end
+
+  defp remove_compile_manifests(build_root, app) do
+    case File.ls(build_root) do
+      {:ok, entries} ->
+        for entry <- entries,
+            full = Path.join(build_root, entry),
+            File.dir?(full) do
+          manifest = Path.join([full, "lib", to_string(app), ".mix", "compile.elixir_scm"])
+          _ = File.rm(manifest)
+        end
+
+      _ ->
+        :ok
+    end
   end
 
   defp with_depending(deps, all_deps) do

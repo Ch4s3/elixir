@@ -60,6 +60,52 @@ defmodule Mix.Dep.LockTest do
     end)
   end
 
+  describe "hash/1" do
+    test "returns nil when no lockfile exists", context do
+      in_tmp(context.test, fn ->
+        assert Mix.Dep.Lock.hash() == nil
+      end)
+    end
+
+    test "returns nil when lockfile is empty", context do
+      in_tmp(context.test, fn ->
+        File.write!("mix.lock", "")
+        assert Mix.Dep.Lock.hash() == nil
+      end)
+    end
+
+    test "returns an 8-character hex hash", context do
+      in_tmp(context.test, fn ->
+        Mix.Dep.Lock.write(%{foo: {:hex, :foo, "0.1.0"}})
+        hash = Mix.Dep.Lock.hash()
+        assert is_binary(hash)
+        assert byte_size(hash) == 8
+        assert hash =~ ~r/^[0-9a-f]{8}$/
+      end)
+    end
+
+    test "is stable for identical content", context do
+      in_tmp(context.test, fn ->
+        Mix.Dep.Lock.write(%{foo: {:hex, :foo, "0.1.0"}})
+        h1 = Mix.Dep.Lock.hash()
+        h2 = Mix.Dep.Lock.hash()
+        assert h1 == h2
+      end)
+    end
+
+    test "differs when lockfile content differs", context do
+      in_tmp(context.test, fn ->
+        Mix.Dep.Lock.write(%{foo: {:hex, :foo, "0.1.0"}})
+        h1 = Mix.Dep.Lock.hash()
+
+        Mix.Dep.Lock.write(%{foo: {:hex, :foo, "0.2.0"}})
+        h2 = Mix.Dep.Lock.hash()
+
+        assert h1 != h2
+      end)
+    end
+  end
+
   test "raises a proper error for merge conflicts", context do
     in_tmp(context.test, fn ->
       File.write("mix.lock", ~S"""
